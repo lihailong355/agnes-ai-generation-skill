@@ -31,26 +31,34 @@ def get_api_key() -> str:
     )
 
 
-def request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def request_json(method: str, path: str, payload: dict[str, Any] | None = None, timeout_val: int | None = None, max_retries: int = 3) -> dict[str, Any]:
+    if timeout_val is None:
+        timeout_val = 300
     body = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        BASE_URL + path,
-        data=body,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {get_api_key()}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            text = resp.read().decode("utf-8")
-            return json.loads(text) if text else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"HTTP {exc.code} from {path}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"Request failed for {path}: {exc}") from exc
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(
+            BASE_URL + path,
+            data=body,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {get_api_key()}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_val) as resp:
+                text = resp.read().decode("utf-8")
+                return json.loads(text) if text else {}
+        except urllib.error.HTTPError as exc:
+            # HTTP errors don't retry, they're client/server errors
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise SystemExit(f"HTTP {exc.code} from {path}: {detail}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            if attempt < max_retries:
+                print(f"Request failed for {path} (attempt {attempt}/{max_retries}): {exc}. Retrying...", file=sys.stderr)
+                time.sleep(min(2 ** attempt, 10))
+                continue
+            raise SystemExit(f"Request failed for {path} after {max_retries} retries: {exc}") from exc
 
 
 def request_text(method: str, path: str, payload: dict[str, Any] | None = None) -> str:
@@ -65,7 +73,7 @@ def request_text(method: str, path: str, payload: dict[str, Any] | None = None) 
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -330,21 +338,37 @@ def video_payload(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
-def poll_video(task_id: str, timeout: int, interval: int) -> dict[str, Any]:
+def poll_video(task_id: str, video_id: str | None, timeout: int, interval: int) -> dict[str, Any]:
+    """Poll for video completion. Use V2.0 /agnesapi endpoint by default for reliability."""
     deadline = time.time() + timeout
     last: dict[str, Any] = {}
+    status_interval = max(5, interval // 3)  # print status more frequently than full request
+    last_status_print = 0
     while time.time() < deadline:
-        last = request_json("GET", f"/v1/videos/{task_id}")
+        elapsed = time.time() - deadline + timeout
+        if video_id:
+            # V2.0 recommended endpoint
+            url = f"/agnesapi?video_id={video_id}"
+            last = request_json("GET", url, timeout_val=min(120, timeout - elapsed))
+        else:
+            # Legacy endpoint
+            last = request_json("GET", f"/v1/videos/{task_id}", timeout_val=min(120, timeout - elapsed))
         if last.get("error") and not last.get("remixed_from_video_id"):
-            raise SystemExit(f"Video task {task_id} returned error: {json.dumps(last, ensure_ascii=False)}")
+            raise SystemExit(f"Video task {task_id or video_id} returned error: {json.dumps(last, ensure_ascii=False)}")
         status = str(last.get("status", "")).lower()
         progress = last.get("progress")
-        if status:
-            print(f"video {task_id}: status={status} progress={progress}", file=sys.stderr)
+        now = time.time()
+        if status and (now - last_status_print) >= status_interval:
+            print(f"video {task_id or video_id}: status={status} progress={progress} (elapsed={int(elapsed)}s)", file=sys.stderr)
+            last_status_print = now
         if status in {"completed", "failed"}:
             return last
-        time.sleep(interval)
-    raise SystemExit(f"Timed out waiting for video task {task_id}. Last response: {json.dumps(last)}")
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        sleep_time = min(interval, remaining)
+        time.sleep(sleep_time)
+    raise SystemExit(f"Timed out waiting for video task {task_id or video_id}. Last response: {json.dumps(last)}")
 
 
 def cmd_video(args: argparse.Namespace) -> None:
@@ -359,6 +383,7 @@ def cmd_video(args: argparse.Namespace) -> None:
         if video_id:
             model_hint = f" --model-name {VIDEO_MODEL}"
             next_steps.append(f"python scripts/agnes_api.py video-get {task_id} --video-id {video_id}{model_hint}  # V2.0 recommended query")
+            next_steps.append(f"curl -H 'Authorization: Bearer YOUR_KEY' 'https://apihub.agnes-ai.com/agnesapi?video_id={video_id}'  # V2.0 direct query")
         output_result(
             "video-task",
             created,
@@ -370,9 +395,10 @@ def cmd_video(args: argparse.Namespace) -> None:
         )
         return
     task_id = created.get("id") or created.get("task_id")
+    video_id = created.get("video_id")
     if not task_id:
         raise SystemExit(f"Video create response did not include id: {json.dumps(created)}")
-    data = poll_video(str(task_id), args.timeout, args.interval)
+    data = poll_video(str(task_id), video_id, args.timeout, args.interval)
     urls = extract_video_urls(data)
     output_result(
         "video-result",
@@ -459,10 +485,11 @@ def create_video_case(name: str, payload: dict[str, Any], args: argparse.Namespa
     created = request_json("POST", "/v1/videos", payload)
     require_video_ok(f"{name}-create", created)
     task_id = str(created.get("id") or created.get("task_id", ""))
+    video_id = created.get("video_id")
     retrieved = (
-        poll_video(task_id, args.video_timeout, args.video_interval)
+        poll_video(task_id, video_id, args.video_timeout, args.video_interval)
         if args.poll_video
-        else request_json("GET", f"/v1/videos/{task_id}")
+        else request_json("GET", f"/v1/videos/{task_id}", timeout_val=120)
     )
     require_video_ok(f"{name}-get", retrieved, completed=args.poll_video)
     return {"create": created, "get": retrieved}
