@@ -449,11 +449,28 @@ def cmd_video(args: argparse.Namespace) -> None:
             raw_only=args.raw,
         )
         return
+
+    # Polling phase — optionally wrap with live logging
     task_id = created.get("id") or created.get("task_id")
     video_id = created.get("video_id")
     if not task_id:
         raise SystemExit(f"Video create response did not include id: {json.dumps(created)}")
-    data = poll_video(str(task_id), video_id, args.timeout, args.interval)
+
+    def _poll_body():
+        from agnes_logger import LiveLogger
+        logger = LiveLogger("video-poll")
+        logger.__enter__()
+        try:
+            data = poll_video(str(task_id), video_id, args.timeout, args.interval)
+        finally:
+            logger.__exit__(None, None, None)
+        return data
+
+    if args.live:
+        data = _poll_body()
+    else:
+        data = poll_video(str(task_id), video_id, args.timeout, args.interval)
+
     urls = extract_video_urls(data)
     output_result(
         "video-result",
@@ -467,6 +484,17 @@ def cmd_video(args: argparse.Namespace) -> None:
 
 
 def cmd_video_get(args: argparse.Namespace) -> None:
+    from agnes_logger import LiveLogger
+
+    if args.live:
+        with LiveLogger("video-get") as log:
+            _cmd_video_get_inner(args)
+    else:
+        _cmd_video_get_inner(args)
+
+
+def _cmd_video_get_inner(args: argparse.Namespace) -> None:
+    """Inner body for cmd_video_get (runs inside LiveLogger context when --live)."""
     if args.video_id:
         # V2.0 recommended: query by video_id via /agnesapi
         url = f"/agnesapi?video_id={args.video_id}"
@@ -975,6 +1003,17 @@ def cmd_video_storyboard(args: argparse.Namespace) -> None:
 
 def cmd_video_download(args: argparse.Namespace) -> None:
     """Download videos from URLs to local files."""
+    from agnes_logger import LiveLogger
+
+    if args.live:
+        with LiveLogger("video-download") as log:
+            _cmd_video_download_inner(args)
+    else:
+        _cmd_video_download_inner(args)
+
+
+def _cmd_video_download_inner(args: argparse.Namespace) -> None:
+    """Inner body for cmd_video_download (runs inside LiveLogger context)."""
     import ssl
     import shutil
 
@@ -1020,501 +1059,507 @@ def cmd_video_batch(args: argparse.Namespace) -> None:
     import shutil
     import concurrent.futures
 
-    # Step 1: Generate or load storyboard
-    storyboard = None
-    if args.storyboard:
-        with open(args.storyboard, "r") as f:
-            sb_data = json.load(f)
-        storyboard = sb_data.get("segments") if isinstance(sb_data, dict) else sb_data
-        if not storyboard:
-            raise SystemExit(f"Storyboard file has no 'segments' key: {json.dumps(sb_data, ensure_ascii=False)[:200]}")
-        print(f"Loaded storyboard: {len(storyboard)} segments", file=sys.stderr)
-    elif args.story:
-        print("Generating storyboard from story...", file=sys.stderr)
-        sb_payload: dict[str, Any] = {
-            "model": TEXT_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional storyboard artist. Return ONLY valid JSON array. "
-                        "Each segment: {shot, action, camera, mood, lighting, duration, characters}. "
-                        "CRITICAL: Each segment must be VISUALLY DISTINCT. Track character states."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Create a video storyboard for: {args.story}\n\n"
-                        f"- {args.num_segments} segments, each ~{args.duration}s\n"
-                        f"- Output format: JSON array"
-                    ),
-                },
-            ],
-            "temperature": 0,
-            "max_tokens": 4096,
-        }
-        sb_data = request_json("POST", "/v1/chat/completions", sb_payload)
-        content = sb_data["choices"][0]["message"]["content"].strip()
-        import re as _re
-        json_str = content
-        if "```json" in content:
-            json_str = _re.search(r"```json\s*\n(.*?)```", content, _re.DOTALL).group(1)
-        elif "```" in content:
-            json_str = _re.search(r"```\s*\n(.*?)```", content, _re.DOTALL).group(1)
-        try:
-            raw_storyboard = json.loads(json_str)
-            storyboard = raw_storyboard if isinstance(raw_storyboard, list) else raw_storyboard.get("segments", raw_storyboard)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"Storyboard parse error: {exc}\nResponse: {content[:500]}") from exc
-    else:
-        raise SystemExit("Provide --story or --storyboard to generate videos.")
+    from agnes_logger import LiveLogger
 
-    storyboard = [
-        {
-            "segment": i + 1,
-            "shot": s.get("shot", ""),
-            "action": s.get("action", ""),
-            "camera": s.get("camera", "static shot"),
-            "mood": s.get("mood", "neutral"),
-            "lighting": s.get("lighting", "natural light"),
-            "duration": s.get("duration", args.duration),
-            "characters": s.get("characters", []),
-        }
-        for i, s in enumerate(storyboard)
-    ]
+    def _print_cleanup(log_path, tail_pid):
+        print(f"[Pipeline done, log file: {log_path}]", file=sys.stderr, flush=True)
 
-    print(f"Storyboard: {len(storyboard)} segments", file=sys.stderr)
-
-    # Step 2: Collect unique character names and generate ref images
-    all_characters = set()
-    for seg in storyboard:
-        for c in seg.get("characters", []):
-            if isinstance(c, dict):
-                all_characters.add(c.get("name", str(c)))
-            else:
-                all_characters.add(str(c))
-    all_characters = list(all_characters)
-
-    character_images = {}  # character_name -> URL
-    if all_characters:
-        print(f"Generating {len(all_characters)} character reference images...", file=sys.stderr)
-        for char_name in all_characters:
-            seed = hash(char_name) % 100000
-            print(f"  Generating character ref: {char_name} (seed={seed})", file=sys.stderr)
-            char_payload: dict[str, Any] = {
-                "model": IMAGE_MODEL,
-                "prompt": (
-                    f"Professional character design sheet of {char_name}. "
-                    f"Full body, front view, clear details of clothing, hair, and accessories. "
-                    f"Cinematic, detailed, consistent character identity."
-                ),
-                "size": "1280x768",
-                "seed": seed,
+    with LiveLogger("video-batch", print_cleanup=_print_cleanup) as log:
+        # Step 1: Generate or load storyboard
+        storyboard = None
+        if args.storyboard:
+            with open(args.storyboard, "r") as f:
+                sb_data = json.load(f)
+            storyboard = sb_data.get("segments") if isinstance(sb_data, dict) else sb_data
+            if not storyboard:
+                raise SystemExit(f"Storyboard file has no 'segments' key: {json.dumps(sb_data, ensure_ascii=False)[:200]}")
+            print(f"Loaded storyboard: {len(storyboard)} segments", file=sys.stderr)
+        elif args.story:
+            print("Generating storyboard from story...", file=sys.stderr)
+            sb_payload: dict[str, Any] = {
+                "model": TEXT_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a professional storyboard artist. Return ONLY valid JSON array. "
+                            "Each segment: {shot, action, camera, mood, lighting, duration, characters}. "
+                            "CRITICAL: Each segment must be VISUALLY DISTINCT. Track character states."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Create a video storyboard for: {args.story}\n\n"
+                            f"- {args.num_segments} segments, each ~{args.duration}s\n"
+                            f"- Output format: JSON array"
+                        ),
+                    },
+                ],
+                "temperature": 0,
+                "max_tokens": 4096,
             }
-            extra = {"response_format": "url"}
-            char_payload["extra_body"] = extra
-            char_data = request_json("POST", "/v1/images/generations", char_payload)
-            urls = extract_image_urls(char_data)
-            if urls:
-                character_images[char_name] = urls[0]
-                print(f"  Character ref ready: {char_name} -> {urls[0]}", file=sys.stderr)
-            else:
-                print(f"  WARNING: Failed to generate character ref for {char_name}", file=sys.stderr)
-
-    # Step 3: Prepare video payloads for all segments
-    video_payloads = []
-    for seg in storyboard:
-        prompt_parts = []
-        for key in ("shot", "action"):
-            if seg.get(key):
-                prompt_parts.append(str(seg[key]))
-        if seg.get("camera"):
-            prompt_parts.append(f"Camera: {seg['camera']}.")
-        if seg.get("mood"):
-            prompt_parts.append(f"Mood: {seg['mood']}.")
-        if seg.get("lighting"):
-            prompt_parts.append(f"Lighting: {seg['lighting']}.")
-        prompt = " ".join(prompt_parts) if prompt_parts else str(seg.get("shot", ""))
-
-        vp: dict[str, Any] = {
-            "model": VIDEO_MODEL,
-            "prompt": prompt,
-            "width": 1280,
-            "height": 768,
-            "num_frames": 241,
-            "frame_rate": 24,
-        }
-        # Collect character ref URLs for this segment
-        seg_chars = seg.get("characters", [])
-        if seg_chars:
-            seg_refs = []
-            for c in seg_chars:
-                char_name = c.get("name") if isinstance(c, dict) else c
-                if char_name in character_images:
-                    seg_refs.append(character_images[char_name])
-            if seg_refs:
-                if len(seg_refs) == 1:
-                    vp["image"] = seg_refs[0]
-                    vp["mode"] = "ti2vid"
-                else:
-                    vp["extra_body"] = {"image": seg_refs, "mode": "keyframes"}
-                    vp["mode"] = "keyframes"
-
-        video_payloads.append({
-            "payload": vp,
-            "segment": seg,
-            "prompt_used": prompt,
-        })
-
-    # Step 4: Submit all video tasks with progress reporting
-    total_segments = len(video_payloads)
-    print(f"Submitting {total_segments} video tasks...", file=sys.stderr)
-
-    def format_eta(elapsed, progress):
-        if progress and progress > 0 and progress < 100:
-            estimated_total = elapsed / (progress / 100.0)
-            remaining = estimated_total - elapsed
-            mins = int(remaining // 60)
-            secs = int(remaining % 60)
-            return f"ETA {mins}m{secs}s"
-        return ""
-
-    task_results = {}  # seg_num -> task info
-    completed_count = 0
-
-    for vp in video_payloads:
-        seg = vp["segment"]
-        seg_num = seg["segment"]
-        # Stagger submissions to avoid connection drops
-        if seg_num > 1:
-            time.sleep(2)
-        try:
-            print(f"  Submitting segment {seg_num}/{total_segments}: {seg.get('action', '')[:60]}...", file=sys.stderr)
-            created = request_json("POST", "/v1/videos", vp["payload"])
-            task_id = str(created.get("id") or created.get("task_id", ""))
-            video_id = created.get("video_id")
-            status = str(created.get("status", ""))
-            print(f"  ✓ Segment {seg_num} submitted: task={task_id}, status={status}", file=sys.stderr)
-            task_results[seg_num] = {
-                "task_id": task_id,
-                "video_id": video_id,
-                "status": status,
-            }
-        except Exception as exc:
-            print(f"  ✗ Segment {seg_num} FAILED: {exc}", file=sys.stderr)
-            task_results[seg_num] = {"error": str(exc)}
-
-    # Summary after submission
-    submitted = sum(1 for r in task_results.values() if "error" not in r)
-    failed = sum(1 for r in task_results.values() if "error" in r)
-    print(f"\nSubmission summary: {submitted}/{total_segments} succeeded, {failed} failed\n", file=sys.stderr)
-
-    # Collect all task IDs for polling
-    pending = {}
-    for seg_num, task_result in task_results.items():
-        if "error" not in task_result:
-            pending[seg_num] = task_result
-
-    # Poll all tasks with real-time progress
-    if pending:
-        print("=" * 60, file=sys.stderr)
-        print("Polling video tasks for completion...", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
-        poll_start = time.time()
-
-        max_poll_rounds = 600  # ~1 hour max
-        round_num = 0
-        still_pending = set(pending.keys())
-
-        while still_pending and round_num < max_poll_rounds:
-            round_num += 1
-            elapsed = time.time() - poll_start
-
-            # Print progress header every 3 rounds
-            if round_num % 3 == 1 or round_num <= 2:
-                bar_width = 30
-                done_count = total_segments - len(still_pending)
-                overall_progress = (done_count / total_segments) * 100
-                bar_done = int(bar_width * done_count / total_segments)
-                bar = "█" * bar_done + "░" * (bar_width - bar_done)
-                eta_str = ""
-                for seg_num in still_pending:
-                    info = pending[seg_num]
-                    if "progress" in info and info["progress"] and 0 < info["progress"] < 100:
-                        eta_str = format_eta(elapsed, info["progress"])
-                        break
-                print(f"\r[{bar}] {overall_progress:.0f}% — {done_count}/{total_segments} done  {eta_str}", end="", file=sys.stderr, flush=True)
-
-            for seg_num in list(still_pending):
-                info = pending[seg_num]
-                try:
-                    if info.get("video_id"):
-                        data = request_json("GET", f"/agnesapi?video_id={info['video_id']}")
-                    else:
-                        data = request_json("GET", f"/v1/videos/{info['task_id']}")
-                    status = str(data.get("status", "")).lower()
-                    progress = data.get("progress")  # int or None
-
-                    pending[seg_num] = {**info, **data}
-
-                    if status == "completed":
-                        still_pending.discard(seg_num)
-                        completed_count += 1
-                        # Print completion immediately
-                        bar_width = 30
-                        done_count = total_segments - len(still_pending)
-                        overall_progress = (done_count / total_segments) * 100
-                        bar_done = int(bar_width * done_count / total_segments)
-                        bar = "█" * bar_done + "░" * (bar_width - bar_done)
-                        print(f"\r[{bar}] {overall_progress:.0f}% — Segment {seg_num} COMPLETED ✓", end="", file=sys.stderr, flush=True)
-                    elif status == "failed":
-                        still_pending.discard(seg_num)
-                        print(f"\n  ✗ Segment {seg_num} FAILED: {json.dumps(data, ensure_ascii=False)[:200]}", file=sys.stderr)
-                    else:
-                        # Update progress display
-                        if progress and progress > 0 and progress < 100:
-                            seg_progress = f"seg{seg_num}_p{progress}"
-                except Exception as exc:
-                    print(f"\n  Poll error segment {seg_num}: {exc}", file=sys.stderr)
-
-            # Print intermediate status
-            if still_pending:
-                if round_num % 3 == 0:
-                    # Print current status of pending segments
-                    pending_info = []
-                    for sn in still_pending:
-                        p = pending[sn].get("progress")
-                        if p and 0 < p < 100:
-                            pending_info.append(f"{sn}({p}%)")
-                        else:
-                            pending_info.append(f"{sn}(?)")
-                    print(f"\r[{round_num}] Pending: {', '.join(pending_info)}", end="", file=sys.stderr, flush=True)
-
-            # Sleep with decreasing interval as we get closer
-            sleep_time = min(10, max(2, 30 - round_num))
-            if still_pending:
-                time.sleep(sleep_time)
-
-        # Clear the progress line
-        print(file=sys.stderr, flush=True)
-
-    # Final summary
-    print(f"\nPolling complete: {total_segments - len(still_pending)}/{total_segments} videos processed", file=sys.stderr)
-
-    # Step 4.5: Retry failed segments before stitching
-    failed_seg_nums = [s for s in task_results if "error" in task_results[s]]
-    if failed_seg_nums:
-        print(f"\n{'=' * 60}", file=sys.stderr)
-        print(f"Retrying {len(failed_seg_nums)} failed segment(s) before stitching...", file=sys.stderr)
-        print(f"{'=' * 60}", file=sys.stderr)
-        successful_retries = []
-        for seg_num in failed_seg_nums:
-            # Find the original vp entry for this segment
-            vp_entry = None
-            for vp in video_payloads:
-                if vp["segment"]["segment"] == seg_num:
-                    vp_entry = vp
-                    break
-            if not vp_entry:
-                print(f"  ✗ Segment {seg_num}: no payload found for retry", file=sys.stderr)
-                continue
+            sb_data = request_json("POST", "/v1/chat/completions", sb_payload)
+            content = sb_data["choices"][0]["message"]["content"].strip()
+            import re as _re
+            json_str = content
+            if "```json" in content:
+                json_str = _re.search(r"```json\s*\n(.*?)```", content, _re.DOTALL).group(1)
+            elif "```" in content:
+                json_str = _re.search(r"```\s*\n(.*?)```", content, _re.DOTALL).group(1)
             try:
-                print(f"  Retrying segment {seg_num}...", file=sys.stderr)
-                time.sleep(3)
-                created = request_json("POST", "/v1/videos", vp_entry["payload"])
+                raw_storyboard = json.loads(json_str)
+                storyboard = raw_storyboard if isinstance(raw_storyboard, list) else raw_storyboard.get("segments", raw_storyboard)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Storyboard parse error: {exc}\nResponse: {content[:500]}") from exc
+        else:
+            raise SystemExit("Provide --story or --storyboard to generate videos.")
+
+        storyboard = [
+            {
+                "segment": i + 1,
+                "shot": s.get("shot", ""),
+                "action": s.get("action", ""),
+                "camera": s.get("camera", "static shot"),
+                "mood": s.get("mood", "neutral"),
+                "lighting": s.get("lighting", "natural light"),
+                "duration": s.get("duration", args.duration),
+                "characters": s.get("characters", []),
+            }
+            for i, s in enumerate(storyboard)
+        ]
+
+        print(f"Storyboard: {len(storyboard)} segments", file=sys.stderr)
+
+        # Step 2: Collect unique character names and generate ref images
+        all_characters = set()
+        for seg in storyboard:
+            for c in seg.get("characters", []):
+                if isinstance(c, dict):
+                    all_characters.add(c.get("name", str(c)))
+                else:
+                    all_characters.add(str(c))
+        all_characters = list(all_characters)
+
+        character_images = {}  # character_name -> URL
+        if all_characters:
+            print(f"Generating {len(all_characters)} character reference images...", file=sys.stderr)
+            for char_name in all_characters:
+                seed = hash(char_name) % 100000
+                print(f"  Generating character ref: {char_name} (seed={seed})", file=sys.stderr)
+                char_payload: dict[str, Any] = {
+                    "model": IMAGE_MODEL,
+                    "prompt": (
+                        f"Professional character design sheet of {char_name}. "
+                        f"Full body, front view, clear details of clothing, hair, and accessories. "
+                        f"Cinematic, detailed, consistent character identity."
+                    ),
+                    "size": "1280x768",
+                    "seed": seed,
+                }
+                extra = {"response_format": "url"}
+                char_payload["extra_body"] = extra
+                char_data = request_json("POST", "/v1/images/generations", char_payload)
+                urls = extract_image_urls(char_data)
+                if urls:
+                    character_images[char_name] = urls[0]
+                    print(f"  Character ref ready: {char_name} -> {urls[0]}", file=sys.stderr)
+                else:
+                    print(f"  WARNING: Failed to generate character ref for {char_name}", file=sys.stderr)
+
+        # Step 3: Prepare video payloads for all segments
+        video_payloads = []
+        for seg in storyboard:
+            prompt_parts = []
+            for key in ("shot", "action"):
+                if seg.get(key):
+                    prompt_parts.append(str(seg[key]))
+            if seg.get("camera"):
+                prompt_parts.append(f"Camera: {seg['camera']}.")
+            if seg.get("mood"):
+                prompt_parts.append(f"Mood: {seg['mood']}.")
+            if seg.get("lighting"):
+                prompt_parts.append(f"Lighting: {seg['lighting']}.")
+            prompt = " ".join(prompt_parts) if prompt_parts else str(seg.get("shot", ""))
+
+            vp: dict[str, Any] = {
+                "model": VIDEO_MODEL,
+                "prompt": prompt,
+                "width": 1280,
+                "height": 768,
+                "num_frames": 241,
+                "frame_rate": 24,
+            }
+            # Collect character ref URLs for this segment
+            seg_chars = seg.get("characters", [])
+            if seg_chars:
+                seg_refs = []
+                for c in seg_chars:
+                    char_name = c.get("name") if isinstance(c, dict) else c
+                    if char_name in character_images:
+                        seg_refs.append(character_images[char_name])
+                if seg_refs:
+                    if len(seg_refs) == 1:
+                        vp["image"] = seg_refs[0]
+                        vp["mode"] = "ti2vid"
+                    else:
+                        vp["extra_body"] = {"image": seg_refs, "mode": "keyframes"}
+                        vp["mode"] = "keyframes"
+
+            video_payloads.append({
+                "payload": vp,
+                "segment": seg,
+                "prompt_used": prompt,
+            })
+
+        # Step 4: Submit all video tasks with progress reporting
+        total_segments = len(video_payloads)
+        print(f"Submitting {total_segments} video tasks...", file=sys.stderr)
+
+        def format_eta(elapsed, progress):
+            if progress and progress > 0 and progress < 100:
+                estimated_total = elapsed / (progress / 100.0)
+                remaining = elapsed - elapsed
+                mins = int(remaining // 60)
+                secs = int(remaining % 60)
+                return f"ETA {mins}m{secs}s"
+            return ""
+
+        task_results = {}  # seg_num -> task info
+        completed_count = 0
+
+        for vp in video_payloads:
+            seg = vp["segment"]
+            seg_num = seg["segment"]
+            # Stagger submissions to avoid connection drops
+            if seg_num > 1:
+                time.sleep(2)
+            try:
+                print(f"  Submitting segment {seg_num}/{total_segments}: {seg.get('action', '')[:60]}...", file=sys.stderr)
+                created = request_json("POST", "/v1/videos", vp["payload"])
                 task_id = str(created.get("id") or created.get("task_id", ""))
                 video_id = created.get("video_id")
-                print(f"  ✓ Segment {seg_num} resubmitted: task={task_id}", file=sys.stderr)
-                successful_retries.append((seg_num, video_id, task_id))
-            except BaseException as exc:
-                print(f"  ✗ Segment {seg_num} retry FAILED: {exc}", file=sys.stderr)
-                task_results[seg_num]["error"] = f"retry: {exc}"
+                status = str(created.get("status", ""))
+                print(f"  ✓ Segment {seg_num} submitted: task={task_id}, status={status}", file=sys.stderr)
+                task_results[seg_num] = {
+                    "task_id": task_id,
+                    "video_id": video_id,
+                    "status": status,
+                }
+            except Exception as exc:
+                print(f"  ✗ Segment {seg_num} FAILED: {exc}", file=sys.stderr)
+                task_results[seg_num] = {"error": str(exc)}
 
-        # Poll retry tasks
-        if successful_retries:
-            retry_info = {sn: {"video_id": vid, "task_id": tid} for sn, vid, tid in successful_retries}
-            retry_pending = set(sn for sn, _, _ in successful_retries)
-            max_retry_rounds = 600
-            rr = 0
-            while retry_pending and rr < max_retry_rounds:
-                rr += 1
-                for seg_num in list(retry_pending):
-                    info = retry_info[seg_num]
+        # Summary after submission
+        submitted = sum(1 for r in task_results.values() if "error" not in r)
+        failed = sum(1 for r in task_results.values() if "error" in r)
+        print(f"\nSubmission summary: {submitted}/{total_segments} succeeded, {failed} failed\n", file=sys.stderr)
+
+        # Collect all task IDs for polling
+        pending = {}
+        for seg_num, task_result in task_results.items():
+            if "error" not in task_result:
+                pending[seg_num] = task_result
+
+        # Poll all tasks with real-time progress
+        if pending:
+            print("=" * 60, file=sys.stderr)
+            print("Polling video tasks for completion...", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            poll_start = time.time()
+
+            max_poll_rounds = 600  # ~1 hour max
+            round_num = 0
+            still_pending = set(pending.keys())
+
+            while still_pending and round_num < max_poll_rounds:
+                round_num += 1
+                elapsed = time.time() - poll_start
+
+                # Print progress header every 3 rounds
+                if round_num % 3 == 1 or round_num <= 2:
+                    bar_width = 30
+                    done_count = total_segments - len(still_pending)
+                    overall_progress = (done_count / total_segments) * 100
+                    bar_done = int(bar_width * done_count / total_segments)
+                    bar = "█" * bar_done + "░" * (bar_width - bar_done)
+                    eta_str = ""
+                    for seg_num in still_pending:
+                        info = pending[seg_num]
+                        if "progress" in info and info["progress"] and 0 < info["progress"] < 100:
+                            eta_str = format_eta(elapsed, info["progress"])
+                            break
+                    print(f"\r[{bar}] {overall_progress:.0f}% — {done_count}/{total_segments} done  {eta_str}", end="", file=sys.stderr, flush=True)
+
+                for seg_num in list(still_pending):
+                    info = pending[seg_num]
                     try:
                         if info.get("video_id"):
                             data = request_json("GET", f"/agnesapi?video_id={info['video_id']}")
                         else:
                             data = request_json("GET", f"/v1/videos/{info['task_id']}")
                         status = str(data.get("status", "")).lower()
-                        retry_info[seg_num] = {**info, **data}
-                        if status in ("completed", "failed"):
-                            retry_pending.discard(seg_num)
-                            if status == "completed":
-                                completed_count += 1
-                                print(f"  ✓ Segment {seg_num} retry COMPLETED", file=sys.stderr)
+                        progress = data.get("progress")  # int or None
+
+                        pending[seg_num] = {**info, **data}
+
+                        if status == "completed":
+                            still_pending.discard(seg_num)
+                            completed_count += 1
+                            # Print completion immediately
+                            bar_width = 30
+                            done_count = total_segments - len(still_pending)
+                            overall_progress = (done_count / total_segments) * 100
+                            bar_done = int(bar_width * done_count / total_segments)
+                            bar = "█" * bar_done + "░" * (bar_width - bar_done)
+                            print(f"\r[{bar}] {overall_progress:.0f}% — Segment {seg_num} COMPLETED ✓", end="", file=sys.stderr, flush=True)
+                        elif status == "failed":
+                            still_pending.discard(seg_num)
+                            print(f"\n  ✗ Segment {seg_num} FAILED: {json.dumps(data, ensure_ascii=False)[:200]}", file=sys.stderr)
+                        else:
+                            # Update progress display
+                            if progress and progress > 0 and progress < 100:
+                                seg_progress = f"seg{seg_num}_p{progress}"
+                    except Exception as exc:
+                        print(f"\n  Poll error segment {seg_num}: {exc}", file=sys.stderr)
+
+                # Print intermediate status
+                if still_pending:
+                    if round_num % 3 == 0:
+                        # Print current status of pending segments
+                        pending_info = []
+                        for sn in still_pending:
+                            p = pending[sn].get("progress")
+                            if p and 0 < p < 100:
+                                pending_info.append(f"{sn}({p}%)")
                             else:
-                                print(f"  ✗ Segment {seg_num} retry FAILED", file=sys.stderr)
-                    except BaseException as exc:
-                        print(f"  Retry poll error segment {seg_num}: {exc}", file=sys.stderr)
-                if retry_pending:
-                    time.sleep(min(10, max(2, 20 - rr)))
-            print(f"  Retry complete: {len(successful_retries) - len(retry_pending)}/{len(successful_retries)} segments succeeded", file=sys.stderr)
+                                pending_info.append(f"{sn}(?)")
+                        print(f"\r[{round_num}] Pending: {', '.join(pending_info)}", end="", file=sys.stderr, flush=True)
 
-            # Merge retry results into pending dict
-            for seg_num, data in retry_info.items():
-                if "error" not in pending.get(seg_num, {}):
-                    pending[seg_num] = data
+                # Sleep with decreasing interval as we get closer
+                sleep_time = min(10, max(2, 30 - round_num))
+                if still_pending:
+                    time.sleep(sleep_time)
 
-    # Step 5: Download all completed videos
-    print("Downloading videos...", file=sys.stderr)
-    tmpdir = tempfile.mkdtemp(prefix="agnes-batch-")
-    try:
-        segment_videos = []  # list of (seg_num, url, local_path)
-        for seg_num in sorted(pending.keys()):
-            info = pending[seg_num]
-            if info.get("error"):
-                print(f"  Segment {seg_num}: still has error, skipping", file=sys.stderr)
-                continue
-            video_url = extract_video_urls(info)
-            if not video_url:
-                print(f"  Segment {seg_num}: no video URL found", file=sys.stderr)
-                continue
-            video_url = video_url[0]
-            local_path = os.path.join(tmpdir, f"seg{seg_num:03d}.mp4")
-            print(f"  Downloading segment {seg_num}: {video_url}", file=sys.stderr)
-            try:
-                for dl_attempt in range(1, 4):
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    req = urllib.request.Request(video_url, method="GET")
-                    with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
-                        data = resp.read()
-                    with open(local_path, "wb") as f:
-                        f.write(data)
-                    segment_videos.append((seg_num, video_url, local_path))
-                    break
-                else:
-                    print(f"  ✗ Download failed segment {seg_num}: max retries exceeded", file=sys.stderr)
-            except BaseException as exc:
-                if dl_attempt < 3:
-                    print(f"  Download retry segment {seg_num} ({dl_attempt}/3): {exc}", file=sys.stderr)
-                    time.sleep(2)
-                else:
-                    print(f"  ✗ Download failed segment {seg_num}: {exc}", file=sys.stderr)
+            # Clear the progress line
+            print(file=sys.stderr, flush=True)
 
-        # Sort by segment number
-        segment_videos.sort(key=lambda x: x[0])
+        # Final summary
+        print(f"\nPolling complete: {total_segments - len(still_pending)}/{total_segments} videos processed", file=sys.stderr)
 
-        # Step 6: Stitch all videos
-        print("Stitching videos...", file=sys.stderr)
-        if not segment_videos:
-            raise SystemExit("No videos were successfully generated or downloaded.")
+        # Step 4.5: Retry failed segments before stitching
+        failed_seg_nums = [s for s in task_results if "error" in task_results[s]]
+        if failed_seg_nums:
+            print(f"\n{'=' * 60}", file=sys.stderr)
+            print(f"Retrying {len(failed_seg_nums)} failed segment(s) before stitching...", file=sys.stderr)
+            print(f"{'=' * 60}", file=sys.stderr)
+            successful_retries = []
+            for seg_num in failed_seg_nums:
+                # Find the original vp entry for this segment
+                vp_entry = None
+                for vp in video_payloads:
+                    if vp["segment"]["segment"] == seg_num:
+                        vp_entry = vp
+                        break
+                if not vp_entry:
+                    print(f"  ✗ Segment {seg_num}: no payload found for retry", file=sys.stderr)
+                    continue
+                try:
+                    print(f"  Retrying segment {seg_num}...", file=sys.stderr)
+                    time.sleep(3)
+                    created = request_json("POST", "/v1/videos", vp_entry["payload"])
+                    task_id = str(created.get("id") or created.get("task_id", ""))
+                    video_id = created.get("video_id")
+                    print(f"  ✓ Segment {seg_num} resubmitted: task={task_id}", file=sys.stderr)
+                    successful_retries.append((seg_num, video_id, task_id))
+                except Exception as exc:
+                    print(f"  ✗ Segment {seg_num} retry FAILED: {exc}", file=sys.stderr)
+                    task_results[seg_num]["error"] = f"retry: {exc}"
 
-        concat_file = os.path.join(tmpdir, "concat-list.txt")
-        with open(concat_file, "w") as f:
+            # Poll retry tasks
+            if successful_retries:
+                retry_info = {sn: {"video_id": vid, "task_id": tid} for sn, vid, tid in successful_retries}
+                retry_pending = set(sn for sn, _, _ in successful_retries)
+                max_retry_rounds = 600
+                rr = 0
+                while retry_pending and rr < max_retry_rounds:
+                    rr += 1
+                    for seg_num in list(retry_pending):
+                        info = retry_info[seg_num]
+                        try:
+                            if info.get("video_id"):
+                                data = request_json("GET", f"/agnesapi?video_id={info['video_id']}")
+                            else:
+                                data = request_json("GET", f"/v1/videos/{info['task_id']}")
+                            status = str(data.get("status", "")).lower()
+                            retry_info[seg_num] = {**info, **data}
+                            if status in ("completed", "failed"):
+                                retry_pending.discard(seg_num)
+                                if status == "completed":
+                                    completed_count += 1
+                                    print(f"  ✓ Segment {seg_num} retry COMPLETED", file=sys.stderr)
+                                else:
+                                    print(f"  ✗ Segment {seg_num} retry FAILED", file=sys.stderr)
+                        except Exception as exc:
+                            print(f"  Retry poll error segment {seg_num}: {exc}", file=sys.stderr)
+                    if retry_pending:
+                        time.sleep(min(10, max(2, 20 - rr)))
+                print(f"  Retry complete: {len(successful_retries) - len(retry_pending)}/{len(successful_retries)} segments succeeded", file=sys.stderr)
+
+                # Merge retry results into pending dict
+                for seg_num, data in retry_info.items():
+                    if "error" not in pending.get(seg_num, {}):
+                        pending[seg_num] = data
+
+        # Step 5: Download all completed videos
+        print("Downloading videos...", file=sys.stderr)
+        tmpdir = tempfile.mkdtemp(prefix="agnes-batch-")
+        try:
+            segment_videos = []  # list of (seg_num, url, local_path)
+            for seg_num in sorted(pending.keys()):
+                info = pending[seg_num]
+                if info.get("error"):
+                    print(f"  Segment {seg_num}: still has error, skipping", file=sys.stderr)
+                    continue
+                video_url = extract_video_urls(info)
+                if not video_url:
+                    print(f"  Segment {seg_num}: no video URL found", file=sys.stderr)
+                    continue
+                video_url = video_url[0]
+                local_path = os.path.join(tmpdir, f"seg{seg_num:03d}.mp4")
+                print(f"  Downloading segment {seg_num}: {video_url}", file=sys.stderr)
+                try:
+                    for dl_attempt in range(1, 4):
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        req = urllib.request.Request(video_url, method="GET")
+                        with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
+                            data = resp.read()
+                        with open(local_path, "wb") as f:
+                            f.write(data)
+                        segment_videos.append((seg_num, video_url, local_path))
+                        break
+                    else:
+                        print(f"  ✗ Download failed segment {seg_num}: max retries exceeded", file=sys.stderr)
+                except Exception as exc:
+                    if dl_attempt < 3:
+                        print(f"  Download retry segment {seg_num} ({dl_attempt}/3): {exc}", file=sys.stderr)
+                        time.sleep(2)
+                    else:
+                        print(f"  ✗ Download failed segment {seg_num}: {exc}", file=sys.stderr)
+
+            # Sort by segment number
+            segment_videos.sort(key=lambda x: x[0])
+
+            # Step 6: Stitch all videos
+            print("Stitching videos...", file=sys.stderr)
+            if not segment_videos:
+                raise SystemExit("No videos were successfully generated or downloaded.")
+
+            concat_file = os.path.join(tmpdir, "concat-list.txt")
+            with open(concat_file, "w") as f:
+                for _, _, local_path in segment_videos:
+                    f.write(f"file '{os.path.basename(local_path)}'\n")
+
+            output = args.output or "output-video.mp4"
+
+            # Try xfade first
+            durations = []
             for _, _, local_path in segment_videos:
-                f.write(f"file '{os.path.basename(local_path)}'\n")
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", local_path],
+                        capture_output=True, text=True,
+                    )
+                    durations.append(float(probe.stdout.strip()))
+                except Exception:
+                    durations.append(10.0)
 
-        output = args.output or "output-video.mp4"
+            n = len(segment_videos)
+            xfade_duration = min(0.8, sum(durations) / (n * 2))
 
-        # Try xfade first
-        durations = []
-        for _, _, local_path in segment_videos:
+            input_args = []
+            for _, _, local_path in segment_videos:
+                input_args.extend(["-i", local_path])
+
+            video_filter = ""
+            if n == 2:
+                video_filter = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={durations[0] - xfade_duration:.3f}[vout]"
+            else:
+                video_filter = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={durations[0] - xfade_duration:.3f}[xf0]"
+                offset_v = durations[0] + durations[1] - 2 * xfade_duration
+                for i in range(2, n):
+                    prev = "[xf0]" if i == 2 else f"[xf{i-2}]"
+                    label = f"[xf{i-1}]" if i < n - 1 else "[vout]"
+                    video_filter += f";{prev}[{i}:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={offset_v:.3f}{label}"
+                    offset_v += durations[i] - xfade_duration
+
+            audio_filter = ""
+            if n == 2:
+                audio_filter = f"[0:a][1:a]acrossfade=duration={xfade_duration:.3f}[aout]"
+            else:
+                audio_filter = f"[0:a][1:a]acrossfade=duration={xfade_duration:.3f}[a0]"
+                offset_a = durations[0] - xfade_duration
+                for i in range(2, n):
+                    prev = "[a0]" if i == 2 else f"[a{i-2}]"
+                    label = f"[a{i-1}]" if i < n - 1 else "[aout]"
+                    audio_filter += f";{prev}[{i}:a]acrossfade=duration={xfade_duration:.3f}{label}"
+                    offset_a += durations[i] - xfade_duration
+
+            filter_complex = video_filter + ";" + audio_filter
+
+            cmd = ["ffmpeg", "-y"] + input_args
+            cmd.extend(["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]"])
+            cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+            cmd.append(output)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Stitch with crossfade failed, falling back to simple concat...", file=sys.stderr)
+                concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                              "-i", concat_file, "-c", "copy", output]
+                subprocess.run(concat_cmd, capture_output=True, text=True)
+
+            # Get final duration
             try:
                 probe = subprocess.run(
                     ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", local_path],
+                     "-of", "default=noprint_wrappers=1:nokey=1", output],
                     capture_output=True, text=True,
                 )
-                durations.append(float(probe.stdout.strip()))
+                final_dur = float(probe.stdout.strip())
             except Exception:
-                durations.append(10.0)
+                final_dur = sum(durations)
 
-        n = len(segment_videos)
-        xfade_duration = min(0.8, sum(durations) / (n * 2))
-
-        input_args = []
-        for _, _, local_path in segment_videos:
-            input_args.extend(["-i", local_path])
-
-        video_filter = ""
-        if n == 2:
-            video_filter = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={durations[0] - xfade_duration:.3f}[vout]"
-        else:
-            video_filter = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={durations[0] - xfade_duration:.3f}[xf0]"
-            offset_v = durations[0] + durations[1] - 2 * xfade_duration
-            for i in range(2, n):
-                prev = "[xf0]" if i == 2 else f"[xf{i-2}]"
-                label = f"[xf{i-1}]" if i < n - 1 else "[vout]"
-                video_filter += f";{prev}[{i}:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={offset_v:.3f}{label}"
-                offset_v += durations[i] - xfade_duration
-
-        audio_filter = ""
-        if n == 2:
-            audio_filter = f"[0:a][1:a]acrossfade=duration={xfade_duration:.3f}[aout]"
-        else:
-            audio_filter = f"[0:a][1:a]acrossfade=duration={xfade_duration:.3f}[a0]"
-            offset_a = durations[0] - xfade_duration
-            for i in range(2, n):
-                prev = "[a0]" if i == 2 else f"[a{i-2}]"
-                label = f"[a{i-1}]" if i < n - 1 else "[aout]"
-                audio_filter += f";{prev}[{i}:a]acrossfade=duration={xfade_duration:.3f}{label}"
-                offset_a += durations[i] - xfade_duration
-
-        filter_complex = video_filter + ";" + audio_filter
-
-        cmd = ["ffmpeg", "-y"] + input_args
-        cmd.extend(["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]"])
-        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
-        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
-        cmd.append(output)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Stitch with crossfade failed, falling back to simple concat...", file=sys.stderr)
-            concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                          "-i", concat_file, "-c", "copy", output]
-            subprocess.run(concat_cmd, capture_output=True, text=True)
-
-        # Get final duration
-        try:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", output],
-                capture_output=True, text=True,
-            )
-            final_dur = float(probe.stdout.strip())
-        except Exception:
-            final_dur = sum(durations)
-
-        print_json({
-            "type": "video-batch",
-            "status": "completed",
-            "output": output,
-            "urls": [output],
-            "num_segments": len(segment_videos),
-            "duration_seconds": round(final_dur, 2),
-            "character_refs": character_images,
-            "segments": [
-                {
-                    "segment": seg_num,
-                    "shot": seg["shot"],
-                    "action": seg["action"],
-                    "url": url,
-                    "path": local_path,
-                }
-                for seg_num, url, local_path, seg in zip(
-                    [sv[0] for sv in segment_videos],
-                    [sv[1] for sv in segment_videos],
-                    [sv[2] for sv in segment_videos],
-                    [sv["segment"] for sv in video_payloads]
-                )
-            ],
-        })
-
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+            print_json({
+                "type": "video-batch",
+                "status": "completed",
+                "output": output,
+                "urls": [output],
+                "num_segments": len(segment_videos),
+                "duration_seconds": round(final_dur, 2),
+                "character_refs": character_images,
+                "segments": [
+                    {
+                        "segment": seg_num,
+                        "shot": seg["shot"],
+                        "action": seg["action"],
+                        "url": url,
+                        "path": local_path,
+                    }
+                    for seg_num, url, local_path, seg in zip(
+                        [sv[0] for sv in segment_videos],
+                        [sv[1] for sv in segment_videos],
+                        [sv[2] for sv in segment_videos],
+                        [sv["segment"] for sv in video_payloads]
+                    )
+                ],
+            })
+        finally:
+            # Cleanup temp dir (inside LiveLogger so stderr is restored)
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1575,6 +1620,7 @@ def build_parser() -> argparse.ArgumentParser:
     video.add_argument("--timeout", type=int, default=900)
     video.add_argument("--interval", type=int, default=10)
     video.add_argument("--raw", action="store_true", help="Print the raw provider response.")
+    video.add_argument("--live", action="store_true", help="Show real-time progress via tail -f.")
     video.set_defaults(func=cmd_video)
 
     video_get = sub.add_parser("video-get", help="Retrieve a video task.")
@@ -1582,6 +1628,7 @@ def build_parser() -> argparse.ArgumentParser:
     video_get.add_argument("--video-id", dest="video_id", help="V2.0 video_id (for /agnesapi endpoint, recommended)")
     video_get.add_argument("--model-name", dest="model_name", help="Explicitly specify model name for query (V2.0)")
     video_get.add_argument("--raw", action="store_true", help="Print the raw provider response.")
+    video_get.add_argument("--live", action="store_true", help="Show real-time progress via tail -f.")
     video_get.set_defaults(func=cmd_video_get)
 
     video_stitch = sub.add_parser("video-stitch", help="Stitch multiple videos into one with seamless transitions.")
@@ -1642,6 +1689,7 @@ def build_parser() -> argparse.ArgumentParser:
     vd = sub.add_parser("video-download", help="Download videos from URLs to local files.")
     vd.add_argument("--urls", required=True, help="Comma-separated video URLs to download.")
     vd.add_argument("--output-dir", default="./downloads", help="Output directory (default: ./downloads).")
+    vd.add_argument("--live", action="store_true", help="Show real-time progress via tail -f.")
     vd.set_defaults(func=cmd_video_download)
 
     # video-batch: full pipeline (storyboard → images → videos → download → stitch)
