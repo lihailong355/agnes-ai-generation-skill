@@ -660,6 +660,169 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_video_stitch(args: argparse.Namespace) -> None:
+    """Stitch multiple videos together with seamless crossfade transitions using ffmpeg."""
+    import subprocess
+    import shutil
+
+    videos = args.input_video
+    if len(videos) < 2:
+        raise SystemExit("--input-video requires at least 2 video URLs.")
+
+    output = args.output or "stitched-video.mp4"
+    fade_duration = args.fade_duration
+    fade_duration_str = f"{fade_duration:.3f}s"
+
+    # Download videos to temp directory
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="agnes-stitch-")
+    try:
+        downloaded = []
+        for i, url in enumerate(videos):
+            print(f"[{i+1}/{len(videos)}] Downloading {url}", file=sys.stderr)
+            out_path = os.path.join(tmpdir, f"seg{i}.mp4")
+            req = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    data = resp.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise SystemExit(f"Failed to download {url}: HTTP {exc.code}: {detail}")
+            except urllib.error.URLError as exc:
+                raise SystemExit(f"Failed to download {url}: {exc}")
+            with open(out_path, "wb") as f:
+                f.write(data)
+            if os.path.getsize(out_path) == 0:
+                raise SystemExit(f"Downloaded empty file for {url}")
+            downloaded.append(out_path)
+
+        # Check ffmpeg is available
+        if not shutil.which("ffmpeg"):
+            raise SystemExit(
+                "ffmpeg is required for video stitching. Install it with: brew install ffmpeg"
+            )
+
+        # Build concat list
+        concat_file = os.path.join(tmpdir, "concat-list.txt")
+        with open(concat_file, "w") as f:
+            for p in downloaded:
+                f.write(f"file '{os.path.basename(p)}'\n")
+
+        # First pass: concat without filters to get total duration and ensure compatibility
+        concat_out = os.path.join(tmpdir, "concatenated.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c", "copy",
+            concat_out,
+        ]
+        result = subprocess.run(concat_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(f"Concat failed: {result.stderr}")
+
+        # Get durations of each segment for precise xfade placement
+        durations = []
+        for p in downloaded:
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", p],
+                    capture_output=True, text=True,
+                )
+                dur = float(probe.stdout.strip())
+                durations.append(dur)
+            except Exception:
+                # Default to 5s if probe fails
+                durations.append(5.0)
+
+        total_duration = sum(durations)
+        num_transitions = len(downloaded) - 1
+        xfade_duration = min(fade_duration, total_duration / (num_transitions * 2))
+
+        # Build xfade filtergraph
+        # First xfade: seg[0:v] and seg[1:v] -> xfade0
+        # Then: xfade0 and seg[2:v] -> xfade1, etc.
+        # For n inputs: need n-1 xfade operations
+        input_args: list[str] = []
+        for p in downloaded:
+            input_args.extend(["-i", p])
+
+        n = len(downloaded)
+        # Build video xfade chain
+        video_filter = ""
+        if n == 2:
+            t = durations[0] - xfade_duration
+            video_filter = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={t:.3f}[vout]"
+        else:
+            video_filter = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={durations[0] - xfade_duration:.3f}[xf0]"
+            offset_v = durations[0] + durations[1] - 2 * xfade_duration
+            for i in range(2, n):
+                prev = "[xf0]" if i == 2 else f"[xf{i-2}]"
+                label = f"[xf{i-1}]" if i < n - 1 else "[vout]"
+                video_filter += f";{prev}[{i}:v]xfade=transition=fade:duration={xfade_duration:.3f}:offset={offset_v:.3f}{label}"
+                offset_v += durations[i] - xfade_duration
+
+        # Build audio acrossfade chain (using duration only, no c1/c2 mode)
+        audio_filter = ""
+        if n == 2:
+            audio_filter = f"[0:a][1:a]acrossfade=duration={xfade_duration:.3f}[aout]"
+        else:
+            audio_filter = f"[0:a][1:a]acrossfade=duration={xfade_duration:.3f}[a0]"
+            offset_a = durations[0] - xfade_duration
+            for i in range(2, n):
+                prev = "[a0]" if i == 2 else f"[a{i-2}]"
+                label = f"[a{i-1}]" if i < n - 1 else "[aout]"
+                audio_filter += f";{prev}[{i}:a]acrossfade=duration={xfade_duration:.3f}{label}"
+                offset_a += durations[i] - xfade_duration
+
+        filter_complex = video_filter + ";" + audio_filter
+
+        cmd = ["ffmpeg", "-y"] + input_args
+        cmd.extend(["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]"])
+        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
+        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+        cmd.append(output)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Stitch with crossfade failed: {result.stderr}", file=sys.stderr)
+            print("Falling back to simple concat (no crossfade)...", file=sys.stderr)
+            concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                          "-i", concat_file, "-c", "copy", output]
+            result2 = subprocess.run(concat_cmd, capture_output=True, text=True)
+            if result2.returncode != 0:
+                raise SystemExit(f"Stitching failed: {result2.stderr}")
+
+        # Get final duration
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", output],
+                capture_output=True, text=True,
+            )
+            final_dur = float(probe.stdout.strip())
+        except Exception:
+            final_dur = total_duration
+
+        print_json({
+            "type": "video-stitch",
+            "status": "completed",
+            "output": output,
+            "urls": [output],
+            "input_count": len(downloaded),
+            "duration_seconds": round(final_dur, 2),
+            "transition": "fade",
+            "fade_duration": round(fade_duration, 2),
+            "segments": [
+                {"url": url, "path": downloaded[i]} for i, url in enumerate(videos)
+            ],
+        })
+
+    finally:
+        # Cleanup temp dir
+        if os.path.exists(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Call Agnes AI generation APIs.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -716,6 +879,34 @@ def build_parser() -> argparse.ArgumentParser:
     video_get.add_argument("--model-name", dest="model_name", help="Explicitly specify model name for query (V2.0)")
     video_get.add_argument("--raw", action="store_true", help="Print the raw provider response.")
     video_get.set_defaults(func=cmd_video_get)
+
+    video_stitch = sub.add_parser("video-stitch", help="Stitch multiple videos into one with seamless transitions.")
+    video_stitch.add_argument(
+        "--input-video", "-i",
+        action="append",
+        required=True,
+        dest="input_video",
+        help="Input video URL to stitch. Repeat for multiple videos.",
+    )
+    video_stitch.add_argument(
+        "--output", "-o",
+        default="stitched-video.mp4",
+        help="Output file path (default: stitched-video.mp4).",
+    )
+    video_stitch.add_argument(
+        "--fade-duration",
+        type=float,
+        default=0.8,
+        help="Crossfade duration in seconds at each transition (default: 0.8).",
+    )
+    video_stitch.add_argument(
+        "--with-audio",
+        action="store_true",
+        default=True,
+        help="Include audio crossfading (default: True).",
+    )
+    video_stitch.add_argument("--raw", action="store_true", help="Print the raw provider response.")
+    video_stitch.set_defaults(func=cmd_video_stitch)
 
     smoke = sub.add_parser("smoke-test", help="Run live text, image, and video API tests.")
     smoke.add_argument("--image-size", default="1024x768")

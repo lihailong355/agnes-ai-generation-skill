@@ -429,3 +429,57 @@ Create a smooth transition from the first keyframe to the second keyframe, maint
 - Image-to-Video tasks require an image URL via `image`.
 - Multi-Image Video tasks require multiple image URLs in `extra_body.image`.
 - Keyframe Animation requires setting `extra_body.mode` to `keyframes`.
+
+---
+
+## CLI: video-stitch (Local Video Stitching)
+
+The Agnes API generates videos in ~5-second segments. Use the `video-stitch` CLI command to concatenate multiple video URLs into one long video with seamless crossfade transitions.
+
+```bash
+python scripts/agnes_api.py video-stitch \
+  -i "https://example.com/video1.mp4" \
+  -i "https://example.com/video2.mp4" \
+  -i "https://example.com/video3.mp4" \
+  -o output.mp4 \
+  --fade-duration 0.8
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|---|---|
+| `--input-video`, `-i` | Input video URL (repeat for multiple videos, minimum 2) |
+| `--output`, `-o` | Output file path (default: `stitched-video.mp4`) |
+| `--fade-duration` | Crossfade duration in seconds at each transition (default: 0.8) |
+| `--with-audio` | Include audio crossfading (default: True) |
+| `--raw` | Print the raw provider response |
+
+**How it works:**
+1. Downloads all input videos to a temporary directory
+2. Uses ffmpeg `xfade` filter for seamless video crossfade at each transition point
+3. Uses ffmpeg `acrossfade` filter for smooth audio crossfade
+4. Re-encodes video with libx264 (CRF 18) and audio with AAC 128k
+5. Cleans up temporary files
+
+**Response format:**
+
+```json
+{
+  "type": "video-stitch",
+  "status": "completed",
+  "output": "stitched-video.mp4",
+  "urls": ["stitched-video.mp4"],
+  "input_count": 3,
+  "duration_seconds": 13.54,
+  "transition": "fade",
+  "fade_duration": 0.8,
+  "segments": [
+    {"url": "https://example.com/video1.mp4", "path": "/tmp/.../seg0.mp4"},
+    {"url": "https://example.com/video2.mp4", "path": "/tmp/.../seg1.mp4"},
+    {"url": "https://example.com/video3.mp4", "path": "/tmp/.../seg2.mp4"}
+  ]
+}
+```
+
+**Tip:** To create a 15+ second video from the API, generate multiple ~5s clips and stitch them together with `video-stitch`. The total duration is: `sum(segment_durations) - (num_segments - 1) × fade_duration`.
