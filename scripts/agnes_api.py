@@ -663,6 +663,7 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
 def cmd_video_stitch(args: argparse.Namespace) -> None:
     """Stitch multiple videos together with seamless crossfade transitions using ffmpeg."""
     import subprocess
+    import ssl
     import shutil
 
     videos = args.input_video
@@ -681,19 +682,26 @@ def cmd_video_stitch(args: argparse.Namespace) -> None:
         for i, url in enumerate(videos):
             print(f"[{i+1}/{len(videos)}] Downloading {url}", file=sys.stderr)
             out_path = os.path.join(tmpdir, f"seg{i}.mp4")
-            req = urllib.request.Request(url, method="GET")
-            try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    data = resp.read()
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                raise SystemExit(f"Failed to download {url}: HTTP {exc.code}: {detail}")
-            except urllib.error.URLError as exc:
-                raise SystemExit(f"Failed to download {url}: {exc}")
+            # Download with SSL bypass and retry on failure
+            data = None
+            for attempt in range(2):
+                try:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    req = urllib.request.Request(url, method="GET")
+                    with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
+                        data = resp.read()
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        print(f"  SSL/network error, retrying... ({exc})", file=sys.stderr)
+                        continue
+                    raise SystemExit(f"Failed to download {url}: {exc}")
+            if not data:
+                raise SystemExit(f"Downloaded empty file for {url}")
             with open(out_path, "wb") as f:
                 f.write(data)
-            if os.path.getsize(out_path) == 0:
-                raise SystemExit(f"Downloaded empty file for {url}")
             downloaded.append(out_path)
 
         # Check ffmpeg is available
