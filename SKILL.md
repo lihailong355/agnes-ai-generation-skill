@@ -84,6 +84,37 @@ Single video smoke test:
 python scripts/agnes_api.py smoke-test --video-case text-to-video
 ```
 
+### Batch Video Pipeline (Story → Video)
+
+Generate a complete video from a story with automatic storyboard generation, character references, parallel video generation, and seamless stitching:
+
+```bash
+# Auto-generate storyboard and full video in one command
+python scripts/agnes_api.py video-batch \
+  --story "农夫与蛇" \
+  --num-segments 6 \
+  --duration 10 \
+  --output farmer-snake.mp4
+
+# Or use a pre-generated storyboard
+python scripts/agnes_api.py video-batch \
+  --storyboard storyboard.json \
+  --output my-video.mp4
+
+# Generate just the storyboard
+python scripts/agnes_api.py video-storyboard \
+  --story "A knight battles a dragon" \
+  --num-segments 4
+```
+
+### Download Videos from URLs
+
+```bash
+python scripts/agnes_api.py video-download \
+  --urls "url1.mp4,url2.mp4,url3.mp4" \
+  --output-dir ./my-videos
+```
+
 ## Workflow
 
 - Prefer `agnes-2.0-flash` for text chat/completions.
@@ -95,6 +126,8 @@ python scripts/agnes_api.py smoke-test --video-case text-to-video
 - The video command defaults to `num_frames=121` and `frame_rate=24` for more stable generation. Video smoke tests default to `num_frames=81` and `frame_rate=24`.
 - Warn the user before costly or long-running live video generation unless they explicitly asked to test or generate video.
 - Test video capabilities one at a time with `smoke-test --video-case <case>` to avoid creating many tasks at once. Supported cases are `text-to-video`, `image-to-video`, `multi-image`, and `keyframes`.
+- **Batch workflow**: For long stories, use `video-batch` to automate the full pipeline. It generates a storyboard, character reference images, all video segments in parallel, downloads them, and stitches into a seamless final video with xfade crossfade transitions.
+- **Storyboard quality**: The `video-storyboard` command produces professional storyboards with unique camera angles, distinct actions per segment, and character state tracking to avoid repeated shots.
 
 ## Current Validation Notes
 

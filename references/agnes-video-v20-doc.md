@@ -483,3 +483,167 @@ python scripts/agnes_api.py video-stitch \
 ```
 
 **Tip:** To create a 15+ second video from the API, generate multiple ~5s clips and stitch them together with `video-stitch`. The total duration is: `sum(segment_durations) - (num_segments - 1) × fade_duration`.
+
+---
+
+## Character Consistency & Long Videos (Best Approach)
+
+The most reliable way to achieve both **character consistency** and **seamless long videos** is to generate a single long video using keyframe images, rather than stitching multiple segments. This eliminates all transition artifacts and is faster (1 API call vs multiple).
+
+### Recommended: Keyframe + Long Video (No Stitching Needed)
+
+Use `num_frames=441` (18 seconds) with character reference images as keyframes. The API's built-in Visual Consistency ensures the same characters appear consistently across all frames.
+
+```bash
+# 1. Generate character keyframe images (one per character)
+python scripts/agnes_api.py image \
+  --prompt "A brave 6-year-old boy, short black hair, red t-shirt, blue jeans, full body, front view, detailed character design" \
+  --size 1024x1024 --seed 42
+
+python scripts/agnes_api.py image \
+  --prompt "A giant fierce tiger, muscular, orange and black stripes, menacing expression, full body" \
+  --size 1024x1024 --seed 99
+
+# 2. Generate a single 18-second video with keyframe transition
+python scripts/agnes_api.py video \
+  --prompt "A boy stands in a grassy field holding a toy rifle. The sky rips open and a giant tiger bursts through. The boy aims his rifle at the tiger as they begin to battle. Cinematic action, dramatic lighting, smooth transition from calm scene to epic battle" \
+  --image "url-of-boy.png" \
+  --image "url-of-tiger-rift.png" \
+  --mode keyframes \
+  --num-frames 441 \
+  --frame-rate 24 \
+  --poll
+```
+
+**Advantages over multi-segment stitching:**
+- **Zero transition artifacts** — 18s generated as a single continuous video
+- **Faster** — 1 API call instead of 3-4 video calls + 1 stitch call
+- **Lower cost** — 1 task vs multiple tasks
+- **Better consistency** — the API's built-in visual consistency maintains characters throughout
+
+### Alternative: Multi-Segment with Character References
+
+If you need separate scenes (different locations, different actions), use character references + stitching:
+
+1. **Generate character reference images** with fixed `--seed`:
+
+```bash
+python scripts/agnes_api.py image \
+  --prompt "A brave 6-year-old boy with short black hair, wearing a red t-shirt and blue jeans, full body portrait" \
+  --size 1024x1024 --seed 42
+```
+
+2. **Generate each video segment** using the same `--character-ref`:
+
+```bash
+# Scene 1
+python scripts/agnes_api.py video \
+  --prompt "The boy stands in a grassy field, looking determined" \
+  --character-ref "https://.../boy.png" \
+  --poll
+
+# Scene 2 (same character ref!)
+python scripts/agnes_api.py video \
+  --prompt "The sky above the field rips open, a tiger emerges" \
+  --character-ref "https://.../boy.png" \
+  --poll
+```
+
+3. **Stitch with crossfade** (uses ffmpeg xfade for seamless transitions):
+
+```bash
+python scripts/agnes_api.py video-stitch \
+  -i "seg1.mp4" -i "seg2.mp4" -i "seg3.mp4" \
+  -o final.mp4 --fade-duration 0.8
+```
+
+### Duration Options
+
+| Flag | Resulting Frames × FPS | Duration | Use Case |
+|---|---|---|---|
+| `--duration 3` | 81 × 24 | ~3s | Quick action shots |
+| `--duration 5` | 121 × 24 | ~5s | Default (single scene) |
+| `--duration 10` | 241 × 24 | ~10s | Single action sequence |
+| `--duration 18` | 441 × 24 | ~18s | Full story (no stitching) |
+
+Or set `--num-frames` and `--frame-rate` directly. Valid `num_frames` values: ≤ 441 and `8n + 1` (81, 121, 161, 201, 241, 281, 321, 361, 401, 441).
+
+### Multi-Character Consistency
+
+When multiple characters appear together, pass all their reference images:
+
+```bash
+# Generate each character with unique seed
+python scripts/agnes_api.py image --prompt "boy..." --seed 42
+python scripts/agnes_api.py image --prompt "girl..." --seed 99
+
+# Use both in video — every scene must include ALL present characters
+python scripts/agnes_api.py video \
+  --prompt "The boy and girl stand together in a field" \
+  --character-ref "url-of-boy.png" \
+  --character-ref "url-of-girl.png" \
+  --poll
+```
+
+### Parameters for Character Consistency
+
+| Parameter | Description |
+|---|---|
+| `--character-ref` | Character reference image URL. Repeat for multiple characters. Must use same refs across segments |
+| `--image` | Keyframe/start frame images (used with `--mode keyframes`) |
+| `--mode keyframes` | Treats images as keyframes for smooth transition between scenes |
+| `--seed` | Fixed seed for reproducible character generation (image command) |
+| `--duration` | Target duration (3/5/10/18 seconds, auto-sets num_frames+frame_rate) |
+| `--num-frames` | Total frames (≤441, must be 8n+1) |
+
+### Key Principles
+
+- **Best consistency**: Use keyframe mode with character images + `--num-frames 441` (18s single video, no stitching)
+- **Same refs always**: Every segment featuring a character must include that character's `--character-ref`
+- **Full-body refs**: Generate at 1024x1024 with detailed description including clothing color, hairstyle, accessories
+- **Describe relationships**: Prompt should describe all characters and their interaction
+
+---
+
+## Batch Video Pipeline: Story → Video
+
+The `video-batch` command automates the entire video creation pipeline from a story to a seamless stitched video.
+
+### Full Pipeline
+
+```bash
+python scripts/agnes_api.py video-batch \
+  --story "农夫与蛇" \
+  --num-segments 6 \
+  --duration 10 \
+  --output farmer-snake.mp4
+```
+
+**Steps (all automatic):**
+1. **Storyboard generation** — calls text API to create a professional storyboard with unique camera angles, distinct actions, and character state tracking
+2. **Character reference generation** — generates one reference image per unique character using fixed seeds for reproducibility
+3. **Parallel video generation** — submits all segments simultaneously (up to 16 concurrent), polls all tasks in parallel
+4. **Download** — downloads all completed videos
+5. **Stitch** — uses ffmpeg xfade crossfade for seamless transitions
+
+### Related Commands
+
+| Command | Purpose |
+|---|---|
+| `video-storyboard` | Generate storyboard JSON from a story |
+| `video-download` | Download videos from URLs to local files |
+| `video-batch` | Full pipeline: story → storyboard → chars → videos → stitch |
+| `video-stitch` | Merge existing video files with crossfade transitions |
+
+### Storyboard JSON Format
+
+Each segment contains:
+- `shot`: English description of the visual (unique per segment)
+- `action`: What characters are doing
+- `camera`: Camera movement (wide shot, close-up, tracking, etc.)
+- `mood`: Emotional tone
+- `lighting`: Lighting description
+- `duration`: Target segment duration
+- `characters`: List of character names in this shot
+- **Prefer long videos**: 10-18s single video > multiple short videos (better consistency, fewer API calls)
+- **Every segment must include ALL character refs** that appear in that scene. Only include refs for characters present in the current scene.
