@@ -211,7 +211,7 @@ def extract_image_urls(data: dict[str, Any]) -> list[str]:
 
 def extract_video_urls(data: dict[str, Any]) -> list[str]:
     urls = []
-    for key in ("video_url", "url", "remixed_from_video_id"):
+    for key in ("remixed_from_video_id", "video_url", "url"):
         value = data.get(key)
         if isinstance(value, str) and value.startswith(("http://", "https://")):
             urls.append(value)
@@ -335,7 +335,7 @@ def poll_video(task_id: str, timeout: int, interval: int) -> dict[str, Any]:
     last: dict[str, Any] = {}
     while time.time() < deadline:
         last = request_json("GET", f"/v1/videos/{task_id}")
-        if last.get("error"):
+        if last.get("error") and not last.get("remixed_from_video_id"):
             raise SystemExit(f"Video task {task_id} returned error: {json.dumps(last, ensure_ascii=False)}")
         status = str(last.get("status", "")).lower()
         progress = last.get("progress")
@@ -350,11 +350,15 @@ def poll_video(task_id: str, timeout: int, interval: int) -> dict[str, Any]:
 def cmd_video(args: argparse.Namespace) -> None:
     created = request_json("POST", "/v1/videos", video_payload(args))
     if not args.poll:
-        task_id = created.get("id")
+        task_id = created.get("id") or created.get("task_id")
+        video_id = created.get("video_id")
         next_steps = []
         if task_id:
             next_steps.append(f"python scripts/agnes_api.py video-get {task_id}")
             next_steps.append(f"python scripts/agnes_api.py video-get {task_id}  # repeat until status is completed")
+        if video_id:
+            model_hint = f" --model-name {VIDEO_MODEL}"
+            next_steps.append(f"python scripts/agnes_api.py video-get {task_id} --video-id {video_id}{model_hint}  # V2.0 recommended query")
         output_result(
             "video-task",
             created,
@@ -365,7 +369,7 @@ def cmd_video(args: argparse.Namespace) -> None:
             raw_only=args.raw,
         )
         return
-    task_id = created.get("id")
+    task_id = created.get("id") or created.get("task_id")
     if not task_id:
         raise SystemExit(f"Video create response did not include id: {json.dumps(created)}")
     data = poll_video(str(task_id), args.timeout, args.interval)
@@ -382,17 +386,31 @@ def cmd_video(args: argparse.Namespace) -> None:
 
 
 def cmd_video_get(args: argparse.Namespace) -> None:
-    data = request_json("GET", f"/v1/videos/{args.task_id}")
+    if args.video_id:
+        # V2.0 recommended: query by video_id via /agnesapi
+        url = f"/agnesapi?video_id={args.video_id}"
+        if args.model_name:
+            url += f"&model_name={args.model_name}"
+        data = request_json("GET", url)
+    else:
+        # Legacy: query by task_id via /v1/videos/{task_id}
+        data = request_json("GET", f"/v1/videos/{args.task_id}")
     urls = extract_video_urls(data)
+    next_steps_list = []
+    if not urls and data.get("status") != "completed":
+        if args.video_id:
+            next_steps_list.append(f"python scripts/agnes_api.py video-get {args.task_id if args.task_id else '...'} --video-id {args.video_id}")
+        else:
+            next_steps_list.append(f"python scripts/agnes_api.py video-get {args.task_id}")
     output_result(
         "video-result",
         data,
         urls=urls,
         status=str(data.get("status", "")) if data.get("status") is not None else None,
-        next_steps=[] if urls else [f"python scripts/agnes_api.py video-get {args.task_id}"],
+        next_steps=next_steps_list if next_steps_list else None,
         raw_only=args.raw,
     )
-    if data.get("error"):
+    if data.get("error") and not urls:
         raise SystemExit(1)
 
 
@@ -440,7 +458,7 @@ def extract_image_url(data: dict[str, Any]) -> str:
 def create_video_case(name: str, payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     created = request_json("POST", "/v1/videos", payload)
     require_video_ok(f"{name}-create", created)
-    task_id = str(created["id"])
+    task_id = str(created.get("id") or created.get("task_id", ""))
     retrieved = (
         poll_video(task_id, args.video_timeout, args.video_interval)
         if args.poll_video
@@ -666,7 +684,9 @@ def build_parser() -> argparse.ArgumentParser:
     video.set_defaults(func=cmd_video)
 
     video_get = sub.add_parser("video-get", help="Retrieve a video task.")
-    video_get.add_argument("task_id")
+    video_get.add_argument("task_id", nargs="?", help="Legacy task_id (for /v1/videos/{task_id} endpoint)")
+    video_get.add_argument("--video-id", dest="video_id", help="V2.0 video_id (for /agnesapi endpoint, recommended)")
+    video_get.add_argument("--model-name", dest="model_name", help="Explicitly specify model name for query (V2.0)")
     video_get.add_argument("--raw", action="store_true", help="Print the raw provider response.")
     video_get.set_defaults(func=cmd_video_get)
 

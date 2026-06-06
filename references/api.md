@@ -57,11 +57,14 @@ For non-English user prompts, translate to English before sending the request. P
 
 Create task endpoint: `POST /v1/videos`
 
-Retrieve task endpoint: `GET /v1/videos/{task_id}`
+Retrieve task endpoints:
+
+- **Recommended (V2.0)**: `GET /agnesapi?video_id=<VIDEO_ID>`
+- **Legacy**: `GET /v1/videos/{task_id}`
 
 Model: `agnes-video-v2.0`
 
-The video API is asynchronous. Create a task, then retrieve or poll by task id.
+The video API is asynchronous. Create a task, then retrieve or poll by task id or video id.
 
 Use English prompts for video generation whenever possible. If the user prompt is not English, translate it to English first, preserving subject, action, scene, camera movement, lighting, style, and constraints.
 
@@ -77,9 +80,9 @@ Optional:
 - `height`: integer, default `768`
 - `width`: integer, default `1152`
 - `num_frames`: integer, must be `<= 441` and satisfy `8n + 1`
+- `frame_rate`: number, supported range `1-60`
 - `num_inference_steps`: integer
 - `seed`: integer
-- `frame_rate`: number, supported range `1-60`
 - `negative_prompt`: string
 - `extra_body.image`: array for multi-image video or keyframe mode
 - `extra_body.mode`: set to `keyframes` for keyframe animation
@@ -91,7 +94,7 @@ Common status values:
 - `completed`
 - `failed`
 
-The completed response usually includes a video URL. In live responses this may appear as `video_url`, `url`, or `remixed_from_video_id`, plus `size`, `seconds`, and `usage.duration_seconds`.
+The completed response includes `remixed_from_video_id` which contains the video URL. This field is only available when `status` is `completed`.
 
 Recommended video defaults:
 
